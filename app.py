@@ -14,12 +14,12 @@ app.secret_key = os.environ.get("SECRET_KEY", os.urandom(24))
 # ── Config ──────────────────────────────────────────────────────────────────
 SPOTIFY_CLIENT_ID     = os.environ.get("SPOTIFY_CLIENT_ID", "YOUR_SPOTIFY_CLIENT_ID")
 SPOTIFY_CLIENT_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET", "YOUR_SPOTIFY_CLIENT_SECRET")
-SPOTIFY_REDIRECT_URI  = "http://localhost:5000/callback/spotify"
+SPOTIFY_REDIRECT_URI  = "http://musicvis.onrender.com/callback/spotify"
 SPOTIFY_SCOPES        = "user-top-read user-read-recently-played user-read-currently-playing user-read-playback-state"
 
 LASTFM_API_KEY    = os.environ.get("LASTFM_API_KEY", "YOUR_LASTFM_API_KEY")
 LASTFM_API_SECRET = os.environ.get("LASTFM_API_SECRET", "YOUR_LASTFM_API_SECRET")
-LASTFM_REDIRECT_URI = "http://localhost:5000/callback/lastfm"
+LASTFM_REDIRECT_URI = "http://musicvis.onrender.com/callback/lastfm"
 
 # ── Landing ──────────────────────────────────────────────────────────────────
 @app.route("/")
