@@ -30,6 +30,17 @@ def index():
                            spotify_connected=spotify_connected,
                            lastfm_connected=lastfm_connected)
 
+@app.route("/debug-redirect")
+def debug_redirect():
+    from urllib.parse import urlencode
+    params = {
+        "client_id": SPOTIFY_CLIENT_ID,
+        "response_type": "code",
+        "redirect_uri": SPOTIFY_REDIRECT_URI,
+        "scope": SPOTIFY_SCOPES,
+    }
+    return f"<pre>Redirect URI being sent:\n{SPOTIFY_REDIRECT_URI}\n\nFull URL:\nhttps://accounts.spotify.com/authorize?{urlencode(params)}</pre>"
+
 @app.route("/dashboard")
 def dashboard():
     spotify_connected = "spotify_token" in session
