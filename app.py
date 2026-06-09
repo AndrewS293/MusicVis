@@ -74,11 +74,15 @@ def login_spotify():
         "redirect_uri":  SPOTIFY_REDIRECT_URI,
         "scope":         SPOTIFY_SCOPES,
         "show_dialog":   "true",
+        "state":         state,
     }
     return redirect("https://accounts.spotify.com/authorize?" + urlencode(params))
 
 @app.route("/callback/spotify")
 def callback_spotify():
+    state = request.args.get("state")
+    if state != session.get("spotify_state"):
+        return "State mismatch — possible CSRF attack", 400
     code = request.args.get("code")
     if not code:
         return redirect(url_for("index"))
