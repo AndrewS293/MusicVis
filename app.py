@@ -7,6 +7,7 @@ from flask import Flask, redirect, request, session, jsonify, render_template, u
 from urllib.parse import urlencode
 from collections import Counter
 from datetime import datetime
+import secrets
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", os.urandom(24))
