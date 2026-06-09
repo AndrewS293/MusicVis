@@ -69,6 +69,8 @@ def switch(platform):
 # ── Spotify OAuth ────────────────────────────────────────────────────────────
 @app.route("/login/spotify")
 def login_spotify():
+    state = secrets.token_hex(16)        # ← this line must be here
+    session["spotify_state"] = state
     params = {
         "client_id":     SPOTIFY_CLIENT_ID,
         "response_type": "code",
