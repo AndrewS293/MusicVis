@@ -6,7 +6,7 @@ import requests
 from flask import Flask, redirect, request, session, jsonify, render_template, url_for
 from urllib.parse import urlencode
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timezone
 import secrets
 
 app = Flask(__name__)
@@ -30,17 +30,6 @@ def index():
     return render_template("index.html",
                            spotify_connected=spotify_connected,
                            lastfm_connected=lastfm_connected)
-
-@app.route("/debug-redirect")
-def debug_redirect():
-    from urllib.parse import urlencode
-    params = {
-        "client_id": SPOTIFY_CLIENT_ID,
-        "response_type": "code",
-        "redirect_uri": SPOTIFY_REDIRECT_URI,
-        "scope": SPOTIFY_SCOPES,
-    }
-    return f"<pre>Redirect URI being sent:\n{SPOTIFY_REDIRECT_URI}\n\nFull URL:\nhttps://accounts.spotify.com/authorize?{urlencode(params)}</pre>"
 
 @app.route("/dashboard")
 def dashboard():
@@ -69,7 +58,7 @@ def switch(platform):
 # ── Spotify OAuth ────────────────────────────────────────────────────────────
 @app.route("/login/spotify")
 def login_spotify():
-    state = secrets.token_hex(16)        # ← this line must be here
+    state = secrets.token_hex(16)
     session["spotify_state"] = state
     params = {
         "client_id":     SPOTIFY_CLIENT_ID,
@@ -123,6 +112,23 @@ def spotify_get(endpoint, params=None):
                      params=params or {})
     return r.json()
 
+def spotify_recently_played_all(limit=200):
+    """Fetch up to `limit` recently played tracks via cursor pagination."""
+    items = []
+    params = {"limit": 50}
+    while len(items) < limit:
+        data = spotify_get("/me/player/recently-played", params)
+        batch = data.get("items", [])
+        if not batch:
+            break
+        items.extend(batch)
+        cursors = data.get("cursors") or {}
+        before  = cursors.get("before")
+        if not before or len(batch) < 50:
+            break
+        params = {"limit": 50, "before": before}
+    return items[:limit]
+
 # ── Last.fm OAuth ────────────────────────────────────────────────────────────
 @app.route("/login/lastfm")
 def login_lastfm():
@@ -161,6 +167,26 @@ def lastfm_get(method, extra=None):
         params.update(extra)
     r = requests.get("https://ws.audioscrobbler.com/2.0/", params=params)
     return r.json()
+
+def lastfm_recent_all(limit=1000):
+    """Fetch up to `limit` recent tracks via page pagination."""
+    tracks = []
+    page = 1
+    per_page = 200
+    while len(tracks) < limit:
+        data = lastfm_get("user.getrecenttracks", {"limit": per_page, "page": page})
+        batch = data.get("recenttracks", {}).get("track", [])
+        if not batch:
+            break
+        # Skip the "now playing" stub (no date)
+        for t in batch:
+            if t.get("date"):
+                tracks.append(t)
+        total_pages = int(data.get("recenttracks", {}).get("@attr", {}).get("totalPages", 1))
+        if page >= total_pages or len(batch) < per_page:
+            break
+        page += 1
+    return tracks[:limit]
 
 # ── API: Top Artists ──────────────────────────────────────────────────────────
 @app.route("/api/top-artists")
@@ -208,38 +234,51 @@ def api_top_tracks():
                   for t in data.get("toptracks", {}).get("track", [])]
     return jsonify(tracks)
 
-# ── API: Taste Radar (Spotify only) ──────────────────────────────────────────
-@app.route("/api/taste-radar")
-def api_taste_radar():
-    data   = spotify_get("/me/top/tracks", {"time_range": "medium_term", "limit": 50})
-    ids    = [t["id"] for t in data.get("items", [])]
-    if not ids:
-        return jsonify({})
-    features_data = spotify_get("/audio-features", {"ids": ",".join(ids)})
-    feats = [f for f in features_data.get("audio_features", []) if f]
-    if not feats:
-        return jsonify({})
-    keys = ["danceability", "energy", "valence", "acousticness", "instrumentalness", "speechiness"]
-    avg  = {k: round(sum(f[k] for f in feats) / len(feats) * 100, 1) for k in keys}
-    return jsonify(avg)
+# ── API: Top Genres (derived from top artists) ────────────────────────────────
+@app.route("/api/top-genres")
+def api_top_genres():
+    """Spotify: genre tags from top artists. Last.fm: top tags per artist."""
+    platform   = request.args.get("platform", session.get("active_platform", "spotify"))
+    time_range = request.args.get("range", "medium_term")
 
-# ── API: Listening Clock (Last.fm) ────────────────────────────────────────────
+    if platform == "spotify":
+        data   = spotify_get("/me/top/artists", {"time_range": time_range, "limit": 50})
+        genres = []
+        for a in data.get("items", []):
+            genres.extend(a.get("genres", []))
+        counts = Counter(genres).most_common(10)
+        total  = sum(c for _, c in counts) or 1
+        return jsonify([{"genre": g.title(), "count": c, "pct": round(c / total * 100)} for g, c in counts])
+    else:
+        # Last.fm: get top tags for top artists
+        data    = lastfm_get("user.gettopartists", {"period": "overall", "limit": 10})
+        artists = data.get("topartists", {}).get("artist", [])
+        tags    = []
+        for a in artists[:5]:
+            td = lastfm_get("artist.getTopTags", {"artist": a["name"]})
+            for tag in td.get("toptags", {}).get("tag", [])[:3]:
+                name  = tag.get("name", "").lower()
+                if name and len(name) > 1:
+                    tags.append(name)
+        counts = Counter(tags).most_common(10)
+        total  = sum(c for _, c in counts) or 1
+        return jsonify([{"genre": g.title(), "count": c, "pct": round(c / total * 100)} for g, c in counts])
+
+# ── API: Listening Clock ──────────────────────────────────────────────────────
 @app.route("/api/listening-clock")
 def api_listening_clock():
     platform = request.args.get("platform", session.get("active_platform", "spotify"))
     hours = [0] * 24
 
     if platform == "lastfm":
-        data   = lastfm_get("user.getrecenttracks", {"limit": 200})
-        tracks = data.get("recenttracks", {}).get("track", [])
+        tracks = lastfm_recent_all(limit=1000)
         for t in tracks:
             uts = t.get("date", {}).get("uts")
             if uts:
-                h = datetime.utcfromtimestamp(int(uts)).hour
+                h = datetime.fromtimestamp(int(uts), tz=timezone.utc).hour
                 hours[h] += 1
     else:
-        data   = spotify_get("/me/player/recently-played", {"limit": 50})
-        items  = data.get("items", [])
+        items = spotify_recently_played_all(limit=200)
         for item in items:
             played_at = item.get("played_at", "")
             if played_at:
@@ -247,42 +286,87 @@ def api_listening_clock():
                 hours[h] += 1
     return jsonify(hours)
 
-# ── API: Scrobble Timeline (Last.fm) ─────────────────────────────────────────
+# ── API: Day-of-week heatmap ──────────────────────────────────────────────────
+@app.route("/api/listening-heatmap")
+def api_listening_heatmap():
+    """Returns a 7×24 matrix (day × hour) of play counts."""
+    platform = request.args.get("platform", session.get("active_platform", "spotify"))
+    grid = [[0] * 24 for _ in range(7)]  # grid[weekday 0=Mon][hour]
+
+    if platform == "lastfm":
+        tracks = lastfm_recent_all(limit=1000)
+        for t in tracks:
+            uts = t.get("date", {}).get("uts")
+            if uts:
+                dt = datetime.fromtimestamp(int(uts), tz=timezone.utc)
+                grid[dt.weekday()][dt.hour] += 1
+    else:
+        items = spotify_recently_played_all(limit=200)
+        for item in items:
+            played_at = item.get("played_at", "")
+            if played_at:
+                dt = datetime.fromisoformat(played_at.replace("Z", "+00:00"))
+                grid[dt.weekday()][dt.hour] += 1
+
+    return jsonify(grid)
+
+# ── API: Scrobble Timeline ────────────────────────────────────────────────────
 @app.route("/api/scrobble-timeline")
 def api_scrobble_timeline():
     platform = request.args.get("platform", session.get("active_platform", "spotify"))
 
     if platform == "lastfm":
-        data   = lastfm_get("user.getrecenttracks", {"limit": 200})
-        tracks = data.get("recenttracks", {}).get("track", [])
+        tracks = lastfm_recent_all(limit=1000)
         by_day = Counter()
         for t in tracks:
             uts = t.get("date", {}).get("uts")
             if uts:
-                day = datetime.utcfromtimestamp(int(uts)).strftime("%Y-%m-%d")
+                day = datetime.fromtimestamp(int(uts), tz=timezone.utc).strftime("%Y-%m-%d")
                 by_day[day] += 1
-        sorted_days = sorted(by_day.items())
-        return jsonify({"labels": [d[0] for d in sorted_days],
-                        "values": [d[1] for d in sorted_days]})
     else:
-        data  = spotify_get("/me/player/recently-played", {"limit": 50})
-        items = data.get("items", [])
+        items = spotify_recently_played_all(limit=200)
         by_day = Counter()
         for item in items:
             played_at = item.get("played_at", "")
             if played_at:
-                day = played_at[:10]
-                by_day[day] += 1
-        sorted_days = sorted(by_day.items())
-        return jsonify({"labels": [d[0] for d in sorted_days],
-                        "values": [d[1] for d in sorted_days]})
+                by_day[played_at[:10]] += 1
+
+    sorted_days = sorted(by_day.items())
+    return jsonify({"labels": [d[0] for d in sorted_days],
+                    "values": [d[1] for d in sorted_days]})
+
+# ── API: Obscurity Score (Spotify only) ──────────────────────────────────────
+@app.route("/api/obscurity")
+def api_obscurity():
+    data    = spotify_get("/me/top/artists", {"time_range": "medium_term", "limit": 20})
+    items   = data.get("items", [])
+    if not items:
+        return jsonify({"score": 50, "label": "Unknown", "top_artists": []})
+
+    score   = round(100 - sum(a["popularity"] for a in items) / len(items))
+    label   = ("Underground Devotee" if score > 70
+               else "Indie Explorer" if score > 45
+               else "Mainstream Enjoyer" if score > 25
+               else "Chart Regular")
+    buckets = {"Very Mainstream (80-100)": 0, "Popular (60-79)": 0,
+               "Mid-tier (40-59)": 0, "Indie (20-39)": 0, "Underground (<20)": 0}
+    for a in items:
+        p = a["popularity"]
+        if p >= 80:   buckets["Very Mainstream (80-100)"] += 1
+        elif p >= 60: buckets["Popular (60-79)"] += 1
+        elif p >= 40: buckets["Mid-tier (40-59)"] += 1
+        elif p >= 20: buckets["Indie (20-39)"] += 1
+        else:         buckets["Underground (<20)"] += 1
+
+    return jsonify({"score": score, "label": label,
+                    "top_artists": [a["name"] for a in items[:3]],
+                    "buckets": buckets})
 
 # ── API: Personality Card ─────────────────────────────────────────────────────
 @app.route("/api/personality")
 def api_personality():
     platform = request.args.get("platform", session.get("active_platform", "spotify"))
 
-    # Gather data
     top_artists = []
     obscurity   = 50
     peak_hour   = 22
@@ -300,30 +384,27 @@ def api_personality():
         if genres:
             top_genre = Counter(genres).most_common(1)[0][0].title()
 
-        clock_data = spotify_get("/me/player/recently-played", {"limit": 50})
+        recent_items = spotify_recently_played_all(limit=200)
         hours = [0] * 24
-        for item in clock_data.get("items", []):
+        for item in recent_items:
             played_at = item.get("played_at", "")
             if played_at:
                 hours[int(played_at[11:13])] += 1
         peak_hour = hours.index(max(hours)) if max(hours) > 0 else 22
 
     else:
-        period_map = {"short_term": "1month", "medium_term": "6month", "long_term": "overall"}
-        data       = lastfm_get("user.gettopartists", {"period": "overall", "limit": 10})
-        artists    = data.get("topartists", {}).get("artist", [])
+        data        = lastfm_get("user.gettopartists", {"period": "overall", "limit": 10})
+        artists     = data.get("topartists", {}).get("artist", [])
         top_artists = [a["name"] for a in artists[:3]]
 
-        clock_data = lastfm_get("user.getrecenttracks", {"limit": 200})
-        tracks     = clock_data.get("recenttracks", {}).get("track", [])
-        hours      = [0] * 24
+        tracks = lastfm_recent_all(limit=1000)
+        hours  = [0] * 24
         for t in tracks:
             uts = t.get("date", {}).get("uts")
             if uts:
-                hours[datetime.utcfromtimestamp(int(uts)).hour] += 1
+                hours[datetime.fromtimestamp(int(uts), tz=timezone.utc).hour] += 1
         peak_hour = hours.index(max(hours)) if max(hours) > 0 else 22
 
-    # Generate personality
     time_label = ("Night Owl" if peak_hour >= 22 or peak_hour < 5
                   else "Early Bird" if peak_hour < 10
                   else "Midday Listener" if peak_hour < 17
@@ -361,28 +442,27 @@ def api_now_playing():
         if data and data.get("item"):
             item = data["item"]
             return jsonify({
-                "playing": data.get("is_playing", False),
-                "name":    item["name"],
-                "artist":  item["artists"][0]["name"],
-                "image":   item["album"]["images"][0]["url"] if item["album"]["images"] else None,
+                "playing":  data.get("is_playing", False),
+                "name":     item["name"],
+                "artist":   item["artists"][0]["name"],
+                "image":    item["album"]["images"][0]["url"] if item["album"]["images"] else None,
                 "progress": data.get("progress_ms", 0),
                 "duration": item.get("duration_ms", 1),
             })
-        # Fall back to recently played
         recent = spotify_get("/me/player/recently-played", {"limit": 1})
         items  = recent.get("items", [])
         if items:
             track = items[0]["track"]
             return jsonify({
-                "playing": False,
-                "name":    track["name"],
-                "artist":  track["artists"][0]["name"],
-                "image":   track["album"]["images"][0]["url"] if track["album"]["images"] else None,
+                "playing":  False,
+                "name":     track["name"],
+                "artist":   track["artists"][0]["name"],
+                "image":    track["album"]["images"][0]["url"] if track["album"]["images"] else None,
                 "progress": 0,
                 "duration": track.get("duration_ms", 1),
             })
     else:
-        data = lastfm_get("user.getrecenttracks", {"limit": 1})
+        data   = lastfm_get("user.getrecenttracks", {"limit": 1})
         tracks = data.get("recenttracks", {}).get("track", [])
         if tracks:
             t       = tracks[0] if isinstance(tracks, list) else tracks
@@ -398,41 +478,6 @@ def api_now_playing():
             })
 
     return jsonify({"playing": False, "name": None})
-
-# ── API: Obscurity Score ──────────────────────────────────────────────────────
-@app.route("/api/obscurity")
-def api_obscurity():
-    if session.get("active_platform") != "spotify":
-        data      = lastfm_get("user.gettopartists", {"period": "overall", "limit": 20})
-        artists   = data.get("topartists", {}).get("artist", [])
-        total     = sum(int(a["playcount"]) for a in artists)
-        top3      = [a["name"] for a in artists[:3]]
-        return jsonify({"score": 55, "label": "Indie Explorer",
-                        "top_artists": top3, "note": "Obscurity scoring requires Spotify"})
-
-    data    = spotify_get("/me/top/artists", {"time_range": "medium_term", "limit": 20})
-    items   = data.get("items", [])
-    if not items:
-        return jsonify({"score": 50, "label": "Unknown", "top_artists": []})
-
-    score   = round(100 - sum(a["popularity"] for a in items) / len(items))
-    label   = ("Underground Devotee" if score > 70
-               else "Indie Explorer" if score > 45
-               else "Mainstream Enjoyer" if score > 25
-               else "Chart Regular")
-    buckets = {"Very Mainstream (80-100)": 0, "Popular (60-79)": 0,
-               "Mid-tier (40-59)": 0, "Indie (20-39)": 0, "Underground (<20)": 0}
-    for a in items:
-        p = a["popularity"]
-        if p >= 80:   buckets["Very Mainstream (80-100)"] += 1
-        elif p >= 60: buckets["Popular (60-79)"] += 1
-        elif p >= 40: buckets["Mid-tier (40-59)"] += 1
-        elif p >= 20: buckets["Indie (20-39)"] += 1
-        else:         buckets["Underground (<20)"] += 1
-
-    return jsonify({"score": score, "label": label,
-                    "top_artists": [a["name"] for a in items[:3]],
-                    "buckets": buckets})
 
 if __name__ == "__main__":
     app.run()
